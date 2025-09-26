@@ -629,7 +629,7 @@ def _ray_scheduling_strategy_fn(
 
     pg = ray.util.placement_group(
         [_get_bundle()] * num_bundles_per_replica,
-        strategy="STRICT_PACK",
+        strategy="PACK",
     )
     return dict(
         scheduling_strategy=PlacementGroupSchedulingStrategy(

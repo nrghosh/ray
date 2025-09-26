@@ -179,10 +179,10 @@ class VLLMEngineConfig(BaseModelExtended):
 
     @property
     def placement_strategy(self) -> str:
-        # If pp <= 1, it's TP so we should make sure all replicas are on the same node.
+        # Use PACK strategy to allow cross-node placement for both TP and PP configurations
         if self.pipeline_parallel_degree > 1:
             return "PACK"
-        return "STRICT_PACK"
+        return "PACK"
 
     @property
     def placement_bundles(self) -> List[Dict[str, float]]:
