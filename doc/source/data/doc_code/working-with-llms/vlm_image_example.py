@@ -62,17 +62,15 @@ vision_processor_config = vLLMEngineProcessorConfig(
         trust_remote_code=True,
         limit_mm_per_prompt={"image": 1},
     ),
-    # Override Ray's runtime env to include the Hugging Face token. Ray Data uses Ray under the hood to orchestrate the inference pipeline.
     runtime_env=dict(
         env_vars=dict(
-            # HF_TOKEN=HF_TOKEN, # Token not needed for public models
             VLLM_USE_V1="1",
         ),
     ),
     batch_size=16,
     accelerator_type="L4",
     concurrency=1,
-    prepare_multimodal_stage={"enabled": True},
+    prepare_multimodal_stage={"enabled": True},  # Enable multimodal processing for VLMs
 )
 # __vlm_config_example_end__
 
@@ -186,9 +184,6 @@ def create_vlm_config():
             trust_remote_code=True,
             limit_mm_per_prompt={"image": 1},
         ),
-        runtime_env={
-            # "env_vars": {"HF_TOKEN": "your-hf-token-here"}  # Token not needed for public models
-        },
         batch_size=1,
         accelerator_type="L4",
         concurrency=1,
@@ -209,7 +204,7 @@ def run_vlm_example():
 
         print("VLM processor configured successfully")
         print(f"Model: {config.model_source}")
-        print(f"Has multimodal support: {config.prepare_multimodal_stage.get('enabled', False)}")
+        print(f"Multimodal processing enabled: {config.prepare_multimodal_stage.get('enabled', False)}")
         result = processor(vision_dataset).take_all()
         return config, processor, result
     # __vlm_run_example_end__
