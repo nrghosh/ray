@@ -535,7 +535,7 @@ Configure individual pipeline stages for fine-grained resource control:
         },
     )
 
-Available fields for all stages: ``enabled``, ``batch_size``, ``concurrency``, ``runtime_env``, ``num_cpus``, ``memory``.
+See :ref:`stage config classes <stage-configs-ref>` for all available fields.
 
 LoRA adapters
 ~~~~~~~~~~~~~
@@ -565,7 +565,7 @@ Use `RunAI Model Streamer <https://github.com/run-ai/runai-model-streamer>`_ for
 Serve deployments
 ~~~~~~~~~~~~~~~~~
 
-Share a vLLM engine across multiple processors using :ref:`Ray Serve <serving-llms>`:
+For multi-turn conversations or complex agentic workflows, share a vLLM engine across multiple processors using :ref:`Ray Serve <serving-llms>`:
 
 .. literalinclude:: doc_code/working-with-llms/basic_llm_example.py
     :language: python
