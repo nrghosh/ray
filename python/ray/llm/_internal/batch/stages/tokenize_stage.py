@@ -19,6 +19,7 @@ class TokenizeUDF(StatefulStageUDF):
         data_column: str,
         expected_input_keys: List[str],
         model: str,
+        trust_remote_code: bool = False,
     ):
         """
         Initialize the TokenizeUDF.
@@ -27,20 +28,31 @@ class TokenizeUDF(StatefulStageUDF):
             data_column: The data column name.
             expected_input_keys: The expected input keys of the stage.
             model: The model to use for the chat template.
+            trust_remote_code: Whether to trust remote code when loading the
+                tokenizer. Required for models that use custom Python code.
         """
         from transformers import AutoTokenizer
 
         super().__init__(data_column, expected_input_keys)
+
+        # When trust_remote_code is True, we need to download Python configuration
+        # files (e.g., configuration_*.py, modeling_*.py) in addition to tokenizer
+        # files. EXCLUDE_SAFETENSORS downloads all files except model weights.
+        if trust_remote_code:
+            download_mode = NodeModelDownloadable.EXCLUDE_SAFETENSORS
+        else:
+            download_mode = NodeModelDownloadable.TOKENIZER_ONLY
+
         model_path = download_model_files(
             model_id=model,
             mirror_config=None,
-            download_model=NodeModelDownloadable.TOKENIZER_ONLY,
+            download_model=download_mode,
             download_extra_files=False,
         )
         self.tokenizer = get_cached_tokenizer(
             AutoTokenizer.from_pretrained(
                 model_path,
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
             )
         )
 
@@ -82,6 +94,7 @@ class DetokenizeUDF(StatefulStageUDF):
         data_column: str,
         expected_input_keys: List[str],
         model: str,
+        trust_remote_code: bool = False,
     ):
         """
         Initialize the DetokenizeUDF.
@@ -90,20 +103,31 @@ class DetokenizeUDF(StatefulStageUDF):
             data_column: The data column name.
             expected_input_keys: The expected input keys of the stage.
             model: The model to use for the chat template.
+            trust_remote_code: Whether to trust remote code when loading the
+                tokenizer. Required for models that use custom Python code.
         """
         from transformers import AutoTokenizer
 
         super().__init__(data_column, expected_input_keys)
+
+        # When trust_remote_code is True, we need to download Python configuration
+        # files (e.g., configuration_*.py, modeling_*.py) in addition to tokenizer
+        # files. EXCLUDE_SAFETENSORS downloads all files except model weights.
+        if trust_remote_code:
+            download_mode = NodeModelDownloadable.EXCLUDE_SAFETENSORS
+        else:
+            download_mode = NodeModelDownloadable.TOKENIZER_ONLY
+
         model_path = download_model_files(
             model_id=model,
             mirror_config=None,
-            download_model=NodeModelDownloadable.TOKENIZER_ONLY,
+            download_model=download_mode,
             download_extra_files=False,
         )
         self.tokenizer = get_cached_tokenizer(
             AutoTokenizer.from_pretrained(
                 model_path,
-                trust_remote_code=True,
+                trust_remote_code=trust_remote_code,
             )
         )
 

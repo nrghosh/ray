@@ -114,11 +114,14 @@ def build_sglang_engine_processor(
     stages = []
 
     # Prepare processor defaults for merging into stage configs
+    # Extract trust_remote_code from engine_kwargs to propagate to preprocessing stages
+    trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
     processor_defaults = {
         "batch_size": config.batch_size,
         "concurrency": config.concurrency,
         "runtime_env": config.runtime_env,
         "model_source": config.model_source,
+        "trust_remote_code": trust_remote_code,
     }
 
     # Resolve and build ChatTemplateStage if enabled
@@ -139,6 +142,7 @@ def build_sglang_engine_processor(
                         chat_template_stage_cfg.chat_template_kwargs,
                         chat_template_kwargs,
                     ),
+                    trust_remote_code=chat_template_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(chat_template_stage_cfg),
             )
@@ -155,6 +159,7 @@ def build_sglang_engine_processor(
             TokenizeStage(
                 fn_constructor_kwargs=dict(
                     model=tokenize_stage_cfg.model_source,
+                    trust_remote_code=tokenize_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(tokenize_stage_cfg),
             )
@@ -202,12 +207,16 @@ def build_sglang_engine_processor(
             DetokenizeStage(
                 fn_constructor_kwargs=dict(
                     model=detokenize_stage_cfg.model_source,
+                    trust_remote_code=detokenize_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(detokenize_stage_cfg),
             )
         )
 
-    hf_config = transformers.AutoConfig.from_pretrained(config.model_source)
+    hf_config = transformers.AutoConfig.from_pretrained(
+        config.model_source,
+        trust_remote_code=trust_remote_code,
+    )
     architecture = getattr(hf_config, "architectures", [DEFAULT_MODEL_ARCHITECTURE])[0]
 
     telemetry_agent = get_or_create_telemetry_agent()

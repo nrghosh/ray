@@ -33,17 +33,35 @@ class ChatTemplateStageConfig(_StageConfigBase):
     )
     chat_template: Optional[str] = Field(default=None)
     chat_template_kwargs: Optional[Dict[str, Any]] = Field(default=None)
+    trust_remote_code: Optional[bool] = Field(
+        default=None,
+        description="Whether to trust remote code when loading the tokenizer/processor. "
+        "Required for models that use custom Python code for configuration. "
+        "If not set, inherits from engine_kwargs.trust_remote_code.",
+    )
 
 
 class TokenizerStageConfig(_StageConfigBase):
     model_source: Optional[str] = Field(
         default=None, description="Model source/identifier for this stage."
     )
+    trust_remote_code: Optional[bool] = Field(
+        default=None,
+        description="Whether to trust remote code when loading the tokenizer. "
+        "Required for models that use custom Python code for configuration. "
+        "If not set, inherits from engine_kwargs.trust_remote_code.",
+    )
 
 
 class DetokenizeStageConfig(_StageConfigBase):
     model_source: Optional[str] = Field(
         default=None, description="Model source/identifier for this stage."
+    )
+    trust_remote_code: Optional[bool] = Field(
+        default=None,
+        description="Whether to trust remote code when loading the tokenizer. "
+        "Required for models that use custom Python code for configuration. "
+        "If not set, inherits from engine_kwargs.trust_remote_code.",
     )
 
 
@@ -103,7 +121,7 @@ def resolve_stage_config(
         )
 
     # Merge processor defaults for fields not explicitly set
-    default_fields = ["batch_size", "concurrency", "runtime_env", "model_source"]
+    default_fields = ["batch_size", "concurrency", "runtime_env", "model_source", "trust_remote_code"]
     for field_name in default_fields:
         # Skip if field doesn't exist on this config class (e.g., model_source only on some stages)
         if not hasattr(resolved, field_name):

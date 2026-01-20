@@ -166,11 +166,14 @@ def build_vllm_engine_processor(
     stages = []
 
     # Prepare processor defaults for merging into stage configs
+    # Extract trust_remote_code from engine_kwargs to propagate to preprocessing stages
+    trust_remote_code = config.engine_kwargs.get("trust_remote_code", False)
     processor_defaults = {
         "batch_size": config.batch_size,
         "concurrency": config.concurrency,
         "runtime_env": config.runtime_env,
         "model_source": config.model_source,
+        "trust_remote_code": trust_remote_code,
     }
 
     # Resolve and build PrepareImageStage if enabled
@@ -241,6 +244,7 @@ def build_vllm_engine_processor(
                         chat_template_stage_cfg.chat_template_kwargs,
                         chat_template_kwargs,
                     ),
+                    trust_remote_code=chat_template_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(chat_template_stage_cfg),
             )
@@ -257,6 +261,7 @@ def build_vllm_engine_processor(
             TokenizeStage(
                 fn_constructor_kwargs=dict(
                     model=tokenize_stage_cfg.model_source,
+                    trust_remote_code=tokenize_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(tokenize_stage_cfg),
             )
@@ -310,6 +315,7 @@ def build_vllm_engine_processor(
             DetokenizeStage(
                 fn_constructor_kwargs=dict(
                     model=detokenize_stage_cfg.model_source,
+                    trust_remote_code=detokenize_stage_cfg.trust_remote_code or False,
                 ),
                 map_batches_kwargs=build_cpu_stage_map_kwargs(detokenize_stage_cfg),
             )
@@ -317,7 +323,11 @@ def build_vllm_engine_processor(
 
     # We download the config files here so that we can report the underlying architecture to the telemetry system.
     # This should be a lightweight operation.
+    # When trust_remote_code is True, we need to download Python configuration files
+    # in addition to tokenizer files. EXCLUDE_SAFETENSORS downloads all files except model weights.
     if config.engine_kwargs.get("load_format", None) in STREAMING_LOAD_FORMATS:
+        download_model_mode = NodeModelDownloadable.EXCLUDE_SAFETENSORS
+    elif trust_remote_code:
         download_model_mode = NodeModelDownloadable.EXCLUDE_SAFETENSORS
     else:
         download_model_mode = NodeModelDownloadable.TOKENIZER_ONLY
