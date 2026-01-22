@@ -511,6 +511,320 @@ The existing sleep/wakeup and KV transfer infrastructure in Ray Serve LLM provid
 
 ---
 
+## 9. Ray Data LLM Batch Workloads: Extended Analysis
+
+### 9.1 Applicability to Batch Inference
+
+The GPU memory snapshotting techniques analyzed above apply equally to Ray Data LLM batch workloads, but with different cost-benefit tradeoffs.
+
+**Ray Data LLM Architecture** (`python/ray/llm/_internal/batch/`):
+- Uses `ActorPoolStrategy` with vLLM/SGLang engines per actor
+- Each actor initializes a full engine (same startup cost as Serve replicas)
+- Default: `max_tasks_in_flight_per_actor=4`, `max_concurrent_batches=8`
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Ray Data Pipeline                            │
+│                                                                     │
+│  ds.map_batches(VLLMEngineStage, compute=ActorPoolStrategy(...))   │
+│                                                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│  │ GPU Actor 1 │  │ GPU Actor 2 │  │ GPU Actor N │  (Actor Pool)   │
+│  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │                 │
+│  │ │  vLLM   │ │  │ │  vLLM   │ │  │ │  vLLM   │ │                 │
+│  │ │ Engine  │ │  │ │ Engine  │ │  │ │ Engine  │ │                 │
+│  │ └─────────┘ │  │ └─────────┘ │  │ └─────────┘ │                 │
+│  └─────────────┘  └─────────────┘  └─────────────┘                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 Batch vs. Serve: When Does Startup Matter?
+
+| Factor | Ray Serve | Ray Data Batch |
+|--------|-----------|----------------|
+| **Job Duration** | Indefinite (always-on) | Minutes to hours |
+| **Startup Amortization** | Amortized over many requests | Amortized over dataset |
+| **Failure Frequency** | Rare (health checks) | Common (spot preemption) |
+| **Recovery Urgency** | High (SLA, latency) | Medium (throughput) |
+| **Cost Model** | Per-request latency | Per-token throughput |
+
+**Key Insight**: For batch jobs, initialization cost matters primarily when:
+1. **Job duration < 10x startup time**: Short jobs (< 30 min) feel the pain
+2. **High failure rate**: Spot instances with 10-20% preemption rate
+3. **Large actor pools**: N actors × startup time = significant cluster cost
+
+### 9.3 Current Ray Data Fault Tolerance
+
+From `python/ray/llm/_internal/batch/stages/vllm_engine_stage.py:701-722`:
+
+```python
+except _VLLM_FATAL_ERRORS as e:  # EngineDeadError
+    # Fatal engine errors indicate the vLLM engine subprocess is dead
+    # but the Ray actor is still alive.
+    #
+    # Fix: exit the actor so Ray can restart it with a fresh engine.
+    # Ray Data's max_restarts=-1 (default) will create a replacement
+    # actor, and task retries will go to healthy actors.
+    logger.error(f"[vLLM] Fatal engine error, exiting actor: {e}")
+    os._exit(1)
+```
+
+**Current behavior on failure:**
+1. Actor dies → Ray detects failure
+2. Ray creates replacement actor
+3. **Full engine re-initialization** (3-10 min)
+4. Failed tasks retried on healthy actors
+
+**Gap**: No mechanism to speed up step 3.
+
+### 9.4 Proposed Approaches for Batch Resilience
+
+#### Approach 1: Hot Standby Pool ("Stay Ready")
+
+**Concept**: Maintain extra initialized GPU actors that can immediately take over on failure.
+
+```python
+# Proposed configuration
+class WarmPoolConfig:
+    min_warm_replicas: int = 1  # Always keep N actors ready
+    preemption_buffer: float = 0.1  # 10% extra for spot recovery
+    warmup_on_idle: bool = True  # Use idle time for pre-warming
+
+# Usage in Ray Data
+ds.map_batches(
+    VLLMEngineStage,
+    compute=ActorPoolStrategy(
+        min_size=8,
+        max_size=16,
+        warm_pool=WarmPoolConfig(min_warm_replicas=2),
+    ),
+)
+```
+
+**Architecture**:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Actor Pool with Warm Standby                 │
+│                                                                     │
+│  Active Pool (processing)          Warm Pool (idle, ready)         │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   ┌─────┐ ┌─────┐                │
+│  │ A1  │ │ A2  │ │ A3  │ │ A4  │   │ W1  │ │ W2  │                │
+│  │ 🔥  │ │ 🔥  │ │ 🔥  │ │ 🔥  │   │ 💤  │ │ 💤  │                │
+│  └─────┘ └─────┘ └─────┘ └─────┘   └─────┘ └─────┘                │
+│                                          │                          │
+│  On A2 failure:                          │                          │
+│  ┌─────┐         ┌─────┐ ┌─────┐   ┌─────┤ ┌─────┐                │
+│  │ A1  │   ❌    │ A3  │ │ A4  │   │ W1 ─┼─│ W2  │                │
+│  │ 🔥  │         │ 🔥  │ │ 🔥  │   │ 🔥  │ │ 💤  │                │
+│  └─────┘         └─────┘ └─────┘   └─────┘ └─────┘                │
+│                                     ↑ Instant promotion             │
+│                                     + Background: new W3 warming    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation scope:**
+
+| Component | Effort | Location |
+|-----------|--------|----------|
+| Warm pool state tracking | Medium | `actor_pool_map_operator.py` |
+| Actor promotion logic | Medium | `autoscaling_actor_pool.py` |
+| Background warming | Low | New: `warm_pool_manager.py` |
+| Sleep/wakeup integration | Low | Already exists in vLLM |
+| Configuration API | Low | `ActorPoolStrategy` extension |
+
+**Cost-Benefit Analysis:**
+
+| Factor | Impact |
+|--------|--------|
+| **GPU cost** | +10-25% (warm standby overhead) |
+| **Recovery time** | ~0s (instant promotion) vs 3-10 min |
+| **Memory overhead** | Warm actors hold weights in GPU |
+| **Complexity** | Medium (pool state management) |
+
+**When to use:**
+- High-value batch jobs where downtime is expensive
+- Spot instances with high preemption rates
+- Jobs with strict completion deadlines
+
+#### Approach 2: Fast-Replace Mechanism ("Accelerated Autoscaling")
+
+**Concept**: Speed up actor replacement without holding extra GPUs idle.
+
+```python
+# Proposed configuration
+class FastReplaceConfig:
+    snapshot_uri: str  # Pre-built snapshot location
+    use_local_nvme: bool = True  # Cache snapshot locally
+    parallel_init: bool = True  # Initialize while draining failed actor
+
+# Integrates with existing ActorPoolStrategy
+ds.map_batches(
+    VLLMEngineStage,
+    compute=ActorPoolStrategy(
+        min_size=8,
+        max_size=16,
+    ),
+    fast_replace=FastReplaceConfig(
+        snapshot_uri="s3://bucket/snapshots/llama-70b",
+    ),
+)
+```
+
+**Architecture**:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Fast Replace on Failure                         │
+│                                                                     │
+│  Timeline (current):                                                │
+│  ───────────────────────────────────────────────────────────────►   │
+│  │ Failure │ Provision │ Download │ Load │ Compile │ Ready │       │
+│  │         │   Node    │  Model   │ GPU  │ Graphs  │       │       │
+│  │    0s   │   30s     │  120s    │ 60s  │  180s   │ ~6min │       │
+│                                                                     │
+│  Timeline (with fast-replace):                                      │
+│  ───────────────────────────────────────────────────────────────►   │
+│  │ Failure │ Provision │ Load Snapshot │ Ready │                   │
+│  │         │   Node    │  from NVMe    │       │                   │
+│  │    0s   │   30s     │     30s       │ ~1min │                   │
+│                                                                     │
+│  Speedup: ~6x faster recovery                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation scope:**
+
+| Component | Effort | Location |
+|-----------|--------|----------|
+| Snapshot creation CLI | Medium | New: `ray llm snapshot` |
+| Snapshot-aware engine init | Medium | `vllm_engine_stage.py` |
+| Local NVMe caching | Low | Node init callback |
+| Parallel initialization | Medium | `actor_pool_map_operator.py` |
+| S3/GCS snapshot storage | Low | Existing infra |
+
+**Cost-Benefit Analysis:**
+
+| Factor | Impact |
+|--------|--------|
+| **GPU cost** | +0% (no idle capacity) |
+| **Recovery time** | ~1 min vs 3-10 min (still some delay) |
+| **Storage cost** | +$5-50/month per model snapshot |
+| **Complexity** | Medium (snapshot management) |
+
+**When to use:**
+- Cost-sensitive workloads
+- Moderate preemption rates
+- Jobs where 1-min recovery is acceptable
+
+### 9.5 Comparison: Hot Standby vs. Fast-Replace
+
+| Dimension | Hot Standby | Fast-Replace |
+|-----------|-------------|--------------|
+| **Recovery Time** | ~0s (instant) | ~60s |
+| **GPU Cost Overhead** | +10-25% | +0% |
+| **Storage Cost** | +0% | +$5-50/mo |
+| **Implementation Effort** | Medium | Medium |
+| **Best For** | High-value, time-critical | Cost-sensitive, tolerant |
+
+### 9.6 Recommendation: Focus Priority
+
+**Should we focus on Serve or Batch?**
+
+| Factor | Serve Priority | Batch Priority |
+|--------|----------------|----------------|
+| User pain frequency | High (every scale event) | Medium (only on failures) |
+| Latency sensitivity | Critical (SLAs) | Lower (throughput-focused) |
+| Existing workarounds | Limited | Over-provision, retry |
+| Implementation reuse | Foundation for batch | Builds on serve work |
+
+**Recommendation**: **Start with Serve, extend to Batch**
+
+1. The core snapshotting mechanisms (torch compile cache, weight snapshots) benefit both
+2. Serve has higher urgency due to autoscaling requirements
+3. Batch can leverage the same infrastructure with pool-specific extensions
+
+**Phased approach:**
+
+| Phase | Serve Benefit | Batch Benefit |
+|-------|--------------|---------------|
+| Phase 1: Compile cache | 2-3x faster startup | 2-3x faster actor init |
+| Phase 2: Weight snapshots | 3-5x faster startup | 3-5x faster recovery |
+| Phase 3: Hot standby | N/A (already has replicas) | Instant failover |
+| Phase 4: Fast-replace | Faster autoscaling | Faster spot recovery |
+
+### 9.7 Batch-Specific Implementation Details
+
+**Changes to Ray Data actor pool** (`python/ray/data/_internal/`):
+
+```python
+# actor_pool_map_operator.py - proposed additions
+
+class ActorPoolMapOperator:
+    def __init__(
+        self,
+        ...,
+        warm_pool_config: Optional[WarmPoolConfig] = None,
+        fast_replace_config: Optional[FastReplaceConfig] = None,
+    ):
+        self._warm_pool = WarmPoolManager(warm_pool_config)
+        self._fast_replace = FastReplaceManager(fast_replace_config)
+
+    def _handle_actor_failure(self, actor_id: str):
+        if self._warm_pool.has_warm_actor():
+            # Instant promotion
+            replacement = self._warm_pool.promote_warm_actor()
+            self._reassign_tasks(actor_id, replacement)
+            self._warm_pool.start_background_warming()
+        elif self._fast_replace.enabled():
+            # Fast snapshot-based init
+            self._fast_replace.start_replacement(actor_id)
+        else:
+            # Current behavior: full re-init
+            self._start_replacement_actor(actor_id)
+```
+
+**Changes to vLLM batch stage** (`python/ray/llm/_internal/batch/stages/`):
+
+```python
+# vllm_engine_stage.py - proposed additions
+
+class VLLMEngineStage:
+    def __init__(
+        self,
+        ...,
+        snapshot_uri: Optional[str] = None,
+    ):
+        self._snapshot_uri = snapshot_uri
+
+    def _init_engine(self):
+        if self._snapshot_uri:
+            # Fast path: load from snapshot
+            return self._load_from_snapshot(self._snapshot_uri)
+        else:
+            # Current path: full initialization
+            return self._init_engine_from_scratch()
+```
+
+---
+
+## 10. Conclusion (Updated)
+
+GPU memory snapshotting benefits both Ray Serve and Ray Data LLM workloads:
+
+**For Ray Serve**: Primary focus on reducing autoscaling latency and improving responsiveness to demand changes. Implementation provides foundation for batch workloads.
+
+**For Ray Data Batch**: Two complementary approaches address failure recovery:
+1. **Hot Standby**: Instant failover at cost of idle GPU capacity
+2. **Fast-Replace**: 6x faster recovery with minimal cost overhead
+
+**Recommended priority:**
+1. Implement core snapshotting for Serve (benefits both)
+2. Add Fast-Replace for batch (low cost, high impact)
+3. Add Hot Standby as optional premium feature for time-critical batch jobs
+
+The incremental nature of these improvements allows Ray to deliver value at each phase while building toward the full vision of near-instant GPU workload recovery.
+
+---
+
 ## References
 
 - [Ray Serve LLM Deployment Initialization Guide](./user-guides/deployment-initialization.md)
@@ -518,3 +832,4 @@ The existing sleep/wakeup and KV transfer infrastructure in Ray Serve LLM provid
 - [Ray Serve LLM Benchmarks](https://github.com/anyscale/ray-serve-llm-perf-examples)
 - [RunAI Model Streamer](https://docs.vllm.ai/en/stable/models/extensions/runai_model_streamer.html)
 - [LMCache for KV Transfer](https://github.com/LMCache/LMCache)
+- [Ray Data Actor Pool Fault Tolerance](https://docs.ray.io/en/latest/data/api/doc/ray.data.ActorPoolStrategy.html)
